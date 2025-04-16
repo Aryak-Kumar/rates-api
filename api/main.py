@@ -4,7 +4,6 @@ import sqlite3
 import pandas as pd
 from pathlib import Path
 from models import LoanDetails
-from pydantic import ValidationError
 import logging
 
 logging.basicConfig(
@@ -23,84 +22,56 @@ DB_FILE = Path("../data/rates.db")
 
 def get_sofr_rates(start_date: str, end_date: str):
     """Fetch SOFR rates from the database for the given date range."""
-    logger.info(f"Fetching SOFR rates from {start_date} to {end_date}")
-    logger.info(f"Database path: {DB_FILE.resolve()}")
+    logger.info(f"Fetching SOFR rates from {start_date} to {end_date} from {DB_FILE.resolve()}")
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE) # Initiate the connection
         query = "SELECT date, rate FROM sofr_rates WHERE date >= ? AND date <= ?"
-        logger.info(f"Executing query: {query} with params ({start_date}, {end_date})")
-        df = pd.read_sql_query(query, conn, params=(start_date, end_date))
+        df = pd.read_sql_query(query, conn, params=(start_date, end_date)) # Run query with the parameters on the connection DB
         conn.close()
         logger.info(f"Query returned {len(df)} rows")
         if df.empty:
-            logger.warning("No rates found for the given range")
             raise ValueError("No rates found for the given range")
-        rates_dict = df.set_index("date")["rate"].to_dict()
-        logger.info(f"Rates dictionary: {rates_dict}")
-        return rates_dict
+        df["date"] = pd.to_datetime(df["date"]) # Create a dataframe for the dates 
+        df = df.sort_values("date").set_index("date") # Sort the dates 
+        logger.info(f"Rates dictionary: {df.to_dict()['rate']}")
+        return df
     except sqlite3.Error as e:
-        logger.error(f"Database error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {e}") # Raise error for Database error
     except ValueError as e:
-        logger.error(f"Value error: {e}")
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) # Raise error for Value Errors
 
-@app.post("/calculate-rates", response_description="Monthly dates and calculated rates")
-def calculate_rates(loan: dict):
-    """Calculate projected interest rates based on loan details."""
-    logger.info(f"Received raw input: {loan}")
-    try:
-        loan_details = LoanDetails(**loan)
-    except ValidationError as e:
-        logger.error(f"Validation error: {e}")
-        raise HTTPException(status_code=422, detail=e.errors())
-    logger.info(f"Validated loan details: {loan_details}")
+@app.post("/calculate-rates", response_description="Reset dates and calculated rates")
+async def calculate_rates(loan: LoanDetails):
+    logger.info(f"Loan details: {loan}")
     
     today = datetime.today().date()
-    maturity_date = loan_details.maturity_date
-    logger.info(f"Today: {today}, Maturity date: {maturity_date}")
+    maturity_date = loan.maturity_date
+    logger.info(f"Today: {today}, Maturity date: {maturity_date}") # Log the dates for today and the maturity date provided
     
-    if maturity_date <= today:
-        logger.error("Maturity date is not in the future")
+    if maturity_date <= today: # Raise Error if the Maturity date is before today
         raise HTTPException(status_code=422, detail="Maturity date must be in the future")
     
-    # Generate monthly dates
-    dates = pd.date_range(start=today, end=maturity_date, freq="MS").strftime("%Y-%m-%d").tolist()
-    logger.info(f"Generated monthly dates: {dates}")
-    
-    # Set start_date to the first day of the current month
-    start_date = today.replace(day=1).strftime("%Y-%m-%d")
-    end_date = maturity_date.strftime("%Y-%m-%d")
+    start_date = today.replace(day=1).strftime("%Y-%m-%d") # Get the start Date
+    end_date = maturity_date.strftime("%Y-%m-%d") # Get the maturity Date
     logger.info(f"Fetching rates from {start_date} to {end_date}")
-    rates_dict = get_sofr_rates(start_date, end_date)
+    rates_df = get_sofr_rates(start_date, end_date) # Get the SOFR rates between the Dates
     
-    # Create a sorted DataFrame for rates
-    rates_df = pd.DataFrame(list(rates_dict.items()), columns=["date", "rate"])
-    rates_df["date"] = pd.to_datetime(rates_df["date"])
-    rates_df = rates_df.sort_values("date").set_index("date")
+    reset_dates = rates_df.index.strftime("%Y-%m-%d").tolist() # Get the reset Dates 
+    logger.info(f"Reset dates: {reset_dates}")
     
-    # Forward-fill and back-fill rates for all dates
-    all_dates = pd.date_range(start=start_date, end=end_date, freq="D")
-    df_rates = pd.DataFrame(index=all_dates)
-    df_rates["rate"] = rates_df["rate"].reindex(all_dates).ffill().bfill()
-    df_rates.index = df_rates.index.strftime("%Y-%m-%d")
-    logger.info(f"df_rates after fill (first 5 rows):\n{df_rates.head().to_string()}")
+    reset_dates = [d for d in reset_dates if today.replace(day=1) <= pd.to_datetime(d).date() <= maturity_date]
+    if not reset_dates:
+        logger.error("No reset dates found within loan term")
+        raise HTTPException(status_code=404, detail="No reset dates found within loan term")
     
-    # Select monthly rates
-    monthly_rates = df_rates.loc[dates]["rate"].to_dict()
-    logger.info(f"Monthly rates: {monthly_rates}")
-    
-    # Calculate final rates
     result = []
-    for date_str, sofr_rate in monthly_rates.items():
+    for date_str in reset_dates:
+        sofr_rate = rates_df.loc[date_str, "rate"]
         logger.info(f"Processing date {date_str}: SOFR rate = {sofr_rate}")
-        if pd.isna(sofr_rate):
-            logger.error(f"No SOFR rate for {date_str}")
-            raise HTTPException(status_code=404, detail=f"No SOFR rate for {date_str}")
-        final_rate = sofr_rate + loan_details.rate_spread
-        final_rate = max(loan_details.rate_floor, min(loan_details.rate_ceiling, final_rate))
+        final_rate = sofr_rate + loan.rate_spread 
+        final_rate = max(loan.rate_floor, min(loan.rate_ceiling, final_rate)) # Calculate the final rate with parameters
         logger.info(f"Calculated final rate for {date_str}: {final_rate}")
-        result.append({"date": date_str, "rate": final_rate})
+        result.append({"date": date_str, "rate": final_rate}) # Append the Date and Rate in the Result
     
     logger.info(f"Returning result: {result}")
     return result
